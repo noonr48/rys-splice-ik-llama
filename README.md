@@ -10,6 +10,11 @@ This fork does **not** try to replace `ik_llama.cpp` with a separate runtime. In
 - multi-GPU tensor split serving
 - narrow single-token recurrent decode optimization
 
+Public model/release home:
+
+- Hugging Face profile: [`jackasda211233`](https://huggingface.co/jackasda211233)
+- Hugging Face model page: [`jackasda211233/Qwen3.5-27B-Uncensored-RYS-Reasoner-GGUF`](https://huggingface.co/jackasda211233/Qwen3.5-27B-Uncensored-RYS-Reasoner-GGUF)
+
 ## Why this fork exists
 
 The target deployment already worked in `ik_llama.cpp`, but it was carrying more generic runtime logic than necessary for this one exact model/setup. The goal of this fork is to keep everything good about `ik-llama`:
@@ -25,7 +30,7 @@ while adding a **safe RYS-specific fastpath** that activates only when explicitl
 
 ## Results
 
-On the real server and the real model, using the same 3-GPU 8001-style deployment layout:
+On the real server and the real model, using the same 8001-style deployment layout on **three RTX 3090s**:
 
 | Mode | Prompt speed | Decode speed |
 | --- | ---: | ---: |
@@ -38,7 +43,8 @@ That is about a **28% decode throughput gain** in the tested configuration.
 
 This fork is centered on:
 
-- `/home/benbi/qwen35_uncensored_rys/Qwen3.5-27B-Uncensored-RYS-Splice-IQ4_NL-custom.gguf`
+- Hugging Face release page: [`jackasda211233/Qwen3.5-27B-Uncensored-RYS-Reasoner-GGUF`](https://huggingface.co/jackasda211233/Qwen3.5-27B-Uncensored-RYS-Reasoner-GGUF)
+- exact GGUF filename referenced by this fork: `Qwen3.5-27B-Uncensored-RYS-Splice-IQ4_NL-custom.gguf`
 
 Important facts established during reverse-engineering:
 
@@ -238,14 +244,14 @@ cmake --build build --target llama-server -j4
 
 ## Reference deployment used in testing
 
-The tested custom deployment cloned the working offline 8001 layout:
+The tested custom deployment cloned the working offline 8001 layout on **three RTX 3090s**:
 
 - `CUDA_VISIBLE_DEVICES=1,2,3`
 - `--tensor-split 1,1,1`
 - `--split-mode graph`
 - F32 KV cache
 
-In the tested server environment, that mapping resolved to the three 3090s actually used by the process.
+In the tested server environment, that mapping resolved to the three physical RTX 3090s actually used by the process.
 
 ## Output quality notes
 
@@ -264,7 +270,7 @@ That is a serving-mode / token-budget issue, not a fastpath-specific bug.
 
 A base `llama.cpp` comparison was also run against the likely llama-compatible sibling model:
 
-- `/home/benbi/qwen35_uncensored_rys/Qwen3.5-27B-Uncensored-RYS-Splice-IQ4_NL-mainline.gguf`
+- `Qwen3.5-27B-Uncensored-RYS-Splice-IQ4_NL-mainline.gguf`
 
 using:
 
@@ -299,10 +305,6 @@ This fork is intentionally narrower and more deployment-specific.
 For the most detailed internal implementation history, see the authored build/deployment handoff:
 
 - `rys-splice-fastpath-build-history.md`
-
-If that file is not present in the repo snapshot you are reading, the canonical authored copy used during development was:
-
-- `/home/benbi/Desktop/custm 3.5 27b file/rys-splice-fastpath-build-history.md`
 
 ## License
 
