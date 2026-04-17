@@ -15,6 +15,8 @@ Public model/release home:
 - Hugging Face profile: [`jackasda211233`](https://huggingface.co/jackasda211233)
 - Hugging Face model page: [`jackasda211233/Qwen3.5-27B-Uncensored-RYS-Reasoner-GGUF`](https://huggingface.co/jackasda211233/Qwen3.5-27B-Uncensored-RYS-Reasoner-GGUF)
 
+**Experimental benchmark note:** the inference comparison documented in this repo is an experimental, session-specific result from one deployment layout on **three RTX 3090s** and should be treated as directional rather than a broad performance guarantee.
+
 ## Why this fork exists
 
 The target deployment already worked in `ik_llama.cpp`, but it was carrying more generic runtime logic than necessary for this one exact model/setup. The goal of this fork is to keep everything good about `ik-llama`:
@@ -30,7 +32,7 @@ while adding a **safe RYS-specific fastpath** that activates only when explicitl
 
 ## Results
 
-On the real server and the real model, using the same 8001-style deployment layout on **three RTX 3090s**:
+On the real server and the real model, using the same 8001-style deployment layout on **three RTX 3090s**, the following **experimental inference comparison** was recorded:
 
 | Mode | Prompt speed | Decode speed |
 | --- | ---: | ---: |
