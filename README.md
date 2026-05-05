@@ -2,6 +2,68 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
+## SLOANE RYS deployment fork
+
+This `main` branch is the current SLOANE deployment fork used for Qwen/RYS GGUF serving. It is based on `ikawrakow/ik_llama.cpp` and carries additional local support needed by the latest RYS deployment stack.
+
+### Current primary target
+
+The newest tested deployment target is:
+
+- model family: `Qwen3.6-27B-AEON-RYS-15-20`
+- fine-tune: checkpoint 386 behavioral LoRA, strength-merged into the base model
+- selected deploy strength: `s0.10`
+- deploy artifact shape: `IQ4_NL` GGUF with imatrix
+- selected artifact name: `Qwen3.6-27B-AEON-RYS-15-20-ckpt386-s010-IQ4_NL-imatrix.gguf`
+
+The intended serving mode is a merged GGUF, not a live runtime LoRA adapter. Native LoRA loading exists in the runtime, but the current production configuration uses flash attention and graph split, and live LoRA remains incompatible with flash attention on this path. For long-running deployment, use the merged `s0.10` GGUF.
+
+### Tested serving profile
+
+The Qwen3.6 AEON RYS merged-GGUF path was tested with:
+
+```bash
+./build/bin/llama-server \
+  -m /path/to/Qwen3.6-27B-AEON-RYS-15-20-ckpt386-s010-IQ4_NL-imatrix.gguf \
+  -c 65536 \
+  -ngl 999 \
+  -np 1 \
+  -fa on \
+  -sm graph \
+  --temp 0.7 \
+  --jinja \
+  --reasoning-format deepseek \
+  --reasoning-budget 0 \
+  -cram 0 \
+  --ctx-checkpoints 0
+```
+
+### Added support in this fork
+
+This fork carries the deployment changes needed for the Qwen3.6/RYS path:
+
+- Qwen3.6/Qwen3Next GGUF conversion and metadata handling
+- linear-attention LoRA conversion handling for merged-export workflows
+- graph-split recurrent prompt/checkpoint stabilization
+- Jinja and DeepSeek-style reasoning serving flags used by the deployment stack
+- slot-pinned model aliases for OpenAI-compatible clients
+- duplicate tool-call suppression in server-side chat parsing
+- safer streaming chat diffs when partial tool-call parsing is non-monotonic
+
+### Validation summary
+
+The latest Q4NL deployment sweep compared base Q4NL and multiple LoRA merge strengths at temp `0.7`, graph split, flash attention, Jinja, DeepSeek reasoning format, and context `65536`.
+
+| Candidate | Stability result | Read |
+| --- | ---: | --- |
+| base Q4NL | 1/5, mean 0.550 | weak baseline |
+| `s0.10` | strict 9/15, mean 0.842 | selected default candidate |
+| `s0.10` crash-adjusted | 9/14, mean 0.884 | excludes one server crash before model attempt |
+| `s0.20` | 8/15, mean 0.850 | too unstable across repeats |
+| `s0.25` | 6/10, mean 0.875 | first perfect run did not reproduce |
+
+Result: use `s0.10` IQ4_NL as the tentative long-term default for Qwen3.6 AEON RYS merged-GGUF deployment. The result is substantially better than base Q4NL, but still high variance at temp `0.7`.
+
 ## TL;DR
 
 This repository is a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) with better CPU and hybrid GPU/CPU performance, new SOTA quantization types, first-class Bitnet support, better DeepSeek performance via MLA, FlashMLA, fused MoE operations and tensor overrides for hybrid GPU/CPU inference, row-interleaved quant packing, etc.

@@ -153,7 +153,10 @@ std::vector<common_chat_msg_diff> common_chat_msg_diff::compute_diffs(const comm
     }
 
     if (msg_new.tool_calls.size() < msg_prv.tool_calls.size()) {
-        throw std::runtime_error("Invalid diff: now finding less tool calls!");
+        // Incremental tool-call parsing is not guaranteed to be monotonic for every
+        // partial decode. If the parser temporarily finds fewer calls, preserve the
+        // content/reasoning deltas we already collected and wait for a stable parse.
+        return diffs;
     }
 
     if (!msg_prv.tool_calls.empty()) {
@@ -161,7 +164,15 @@ std::vector<common_chat_msg_diff> common_chat_msg_diff::compute_diffs(const comm
         const auto & pref = msg_prv.tool_calls[idx];
         const auto & newf = msg_new.tool_calls[idx];
         if (pref.name != newf.name) {
-            throw std::runtime_error("Invalid diff: tool call mismatch!");
+            // Treat a mid-stream tool-call rewrite as a full replacement for the last
+            // call rather than aborting the request.
+            auto & diff = diffs.emplace_back();
+            diff.tool_call_index = idx;
+            diff.tool_call_delta = newf;
+            if (diff.tool_call_delta.id.empty()) {
+                diff.tool_call_delta.id = pref.id;
+            }
+            return diffs;
         }
         const auto args_diff = string_diff(pref.arguments, newf.arguments);
         if (!args_diff.empty() || pref.id != newf.id) {

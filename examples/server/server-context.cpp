@@ -1334,6 +1334,11 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
         bool do_checkpoint = params_base.ctx_checkpoints_n > 0;
         // make checkpoints only for completion tasks
         do_checkpoint = do_checkpoint && task.type == SERVER_TASK_TYPE_COMPLETION;
+        const bool is_split_mode_graph = llama_model_get_split_mode(llama_get_model(slot.ctx)) == LLAMA_SPLIT_MODE_GRAPH;
+        if (do_checkpoint && is_split_mode_graph) {
+            LLAMA_LOG_WARN("%s: disabling recurrent checkpoints for split-mode graph; partial sequence snapshots are unstable on this path\n", __func__);
+            do_checkpoint = false;
+        }
         // make a checkpoint of the parts of the memory that cannot be rolled back.
         // checkpoints are created only if:
         // - the model architecture is marked as recurrent or hybrid
@@ -2910,6 +2915,10 @@ bool server_context::create_checkpoint(server_slot & slot) {
 }
 
 void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t n_batch,  int32_t & batch_type) {
+    const bool serialize_recurrent_graph_prompts =
+        llama_model_has_recurrent(llama_get_model(ctx)) &&
+        llama_model_get_split_mode(llama_get_model(ctx)) == LLAMA_SPLIT_MODE_GRAPH;
+
     if (params_base.cont_batching || batch.n_tokens == 0) {
         for (auto& slot : slots) {
             // this slot still has a prompt to be processed
@@ -3247,6 +3256,10 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         {"n_tokens", batch.n_tokens},
                         });
                 }
+            }
+
+            if (serialize_recurrent_graph_prompts && batch.n_tokens > 0) {
+                break;
             }
 
             if (batch.n_tokens >= n_batch) {

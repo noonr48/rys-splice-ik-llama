@@ -1838,6 +1838,10 @@ bool llama_model_has_recurrent(const llama_model * model) {
     return llm_arch_is_hybrid(model->arch) || llm_arch_is_recurrent(model->arch);
 }
 
+enum llama_split_mode llama_model_get_split_mode(const struct llama_model * model) {
+    return model->split_mode;
+}
+
 llm_tensor llm_tensor_type(llm_arch arch, const std::string & tensor_name, int il) {
     auto it = LLM_TENSOR_NAMES.find(arch);
     if (it == LLM_TENSOR_NAMES.end()) {

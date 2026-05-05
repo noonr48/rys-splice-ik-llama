@@ -12,8 +12,64 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <unordered_set>
 
 using json = nlohmann::ordered_json;
+
+static std::string trim_copy(const std::string & s) {
+    size_t start = 0;
+    while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) {
+        start++;
+    }
+    size_t end = s.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+        end--;
+    }
+    return s.substr(start, end - start);
+}
+
+static std::string canonicalize_tool_call_arguments(const std::string & arguments, bool is_partial) {
+    std::string out = trim_copy(arguments);
+    if (!is_partial && !out.empty()) {
+        try {
+            // Use the default nlohmann::json object ordering (std::map) so semantically
+            // identical arguments with different key order compare equal.
+            const auto parsed = nlohmann::json::parse(out);
+            out = parsed.dump();
+        } catch (const std::exception &) {
+            // Keep the raw string if it is not valid JSON.
+        }
+    }
+    return out;
+}
+
+static void dedupe_tool_calls(std::vector<common_chat_tool_call> & tool_calls, bool is_partial, const common_chat_syntax & syntax) {
+    // Some weaker tool-calling models will emit the *same* tool call multiple times in one message
+    // (especially when the tool result is empty / slow). Executing all duplicates wastes time and
+    // can be destructive (restarts, repeated scp, etc.). Deduping server-side prevents client-side
+    // runtimes from running the same call repeatedly.
+    if (!syntax.parse_tool_calls || tool_calls.size() < 2) {
+        return;
+    }
+
+    std::unordered_set<std::string> seen;
+    seen.reserve(tool_calls.size());
+
+    std::vector<common_chat_tool_call> out;
+    out.reserve(tool_calls.size());
+
+    for (auto & tc : tool_calls) {
+        std::string key = tc.name;
+        key.push_back('\x1f');
+        key += canonicalize_tool_call_arguments(tc.arguments, is_partial);
+
+        if (seen.insert(key).second) {
+            out.push_back(std::move(tc));
+        }
+    }
+
+    tool_calls = std::move(out);
+}
 
 static void parse_prefixed_json_tool_call_array(common_chat_msg_parser & builder,
                                                 const common_regex &     prefix,
@@ -1513,7 +1569,9 @@ common_chat_msg common_chat_parse(const std::string & input, bool is_partial, co
     if (syntax.format == COMMON_CHAT_FORMAT_PEG_SIMPLE ||
         syntax.format == COMMON_CHAT_FORMAT_PEG_NATIVE ||
         syntax.format == COMMON_CHAT_FORMAT_PEG_CONSTRUCTED) {
-        return common_chat_peg_parse(syntax.parser, input, is_partial, syntax);
+        auto msg = common_chat_peg_parse(syntax.parser, input, is_partial, syntax);
+        dedupe_tool_calls(msg.tool_calls, is_partial, syntax);
+        return msg;
     }
     common_chat_msg_parser builder(input, is_partial, syntax);
     try {
@@ -1527,6 +1585,7 @@ common_chat_msg common_chat_parse(const std::string & input, bool is_partial, co
         }
     }
     auto msg = builder.result();
+    dedupe_tool_calls(msg.tool_calls, is_partial, syntax);
     if (!is_partial) {
         LOG_DBG("Parsed message: %s\n", common_chat_msgs_to_json_oaicompat({msg}).at(0).dump().c_str());
     }
@@ -1560,6 +1619,7 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena & parser, const std
         auto mapper = common_chat_peg_mapper(msg);
         mapper.from_ast(ctx.ast, result);
     }
+    dedupe_tool_calls(msg.tool_calls, is_partial, syntax);
     if (!is_partial) {
         LOG_DBG("Parsed message: %s\n", common_chat_msgs_to_json_oaicompat({msg}).at(0).dump().c_str());
     }

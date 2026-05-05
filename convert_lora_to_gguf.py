@@ -23,7 +23,7 @@ if 'NO_LOCAL_GGUF' not in os.environ:
 import gguf
 
 # reuse model definitions from convert_hf_to_gguf.py
-from convert_hf_to_gguf import LazyTorchTensor, Model
+from convert_hf_to_gguf import LazyTorchTensor, ModelBase as Model
 
 logger = logging.getLogger("lora-to-gguf")
 
@@ -156,6 +156,9 @@ class LoraTorchTensor:
 
     def view(self, *size: int) -> LoraTorchTensor:
         return self.reshape(*size)
+
+    def contiguous(self) -> LoraTorchTensor:
+        return self
 
     def permute(self, *dims: int) -> LoraTorchTensor:
         shape = self.shape
@@ -303,13 +306,15 @@ if __name__ == '__main__':
 
     # load base model
     logger.info(f"Loading base model: {dir_base_model.name}")
-    hparams = Model.load_hparams(dir_base_model)
+    hparams = Model.load_hparams(dir_base_model, False)
     with torch.inference_mode():
         try:
             model_class = Model.from_model_architecture(hparams["architectures"][0])
         except NotImplementedError:
             logger.error(f"Model {hparams['architectures'][0]} is not supported")
             sys.exit(1)
+
+        skip_linear_reorder_parent = model_class.__mro__[1] if len(model_class.__mro__) > 1 else model_class
 
         class LoraModel(model_class):
             model_arch = model_class.model_arch
@@ -367,7 +372,40 @@ if __name__ == '__main__':
                     yield (name, cast(torch.Tensor, LoraTorchTensor(tensor.A, tensor.B)))
 
             def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-                dest = super().modify_tensors(data_torch, name, bid)
+                dest: Iterable[tuple[str, Tensor]]
+
+                if isinstance(data_torch, LoraTorchTensor):
+                    num_k_heads = self.hparams.get("linear_num_key_heads", 0)
+                    num_v_heads = self.hparams.get("linear_num_value_heads", 0)
+
+                    if num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads and "linear_attn." in name:
+                        head_k_dim = self.hparams["linear_key_head_dim"]
+                        head_v_dim = self.hparams["linear_value_head_dim"]
+                        num_v_per_k = num_v_heads // num_k_heads
+                        lora_a, lora_b = data_torch.get_lora_A_B()
+
+                        if ".in_proj_qkv." in name:
+                            q_dim = head_k_dim * num_k_heads
+                            k_dim = head_k_dim * num_k_heads
+                            q = lora_b[:q_dim]
+                            k = lora_b[q_dim:q_dim + k_dim]
+                            v = lora_b[q_dim + k_dim:]
+                            v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
+                            lora_b = torch.cat([q, k, v], dim=0)
+                        elif ".in_proj_z." in name:
+                            lora_b = self._reorder_v_heads(lora_b, 0, num_k_heads, num_v_per_k, head_v_dim)
+                        elif ".in_proj_b." in name or ".in_proj_a." in name:
+                            lora_b = self._reorder_v_heads(lora_b, 0, num_k_heads, num_v_per_k, 1)
+                        elif ".out_proj." in name:
+                            lora_a = self._reorder_v_heads(lora_a, 1, num_k_heads, num_v_per_k, head_v_dim)
+
+                        data_torch = cast(torch.Tensor, LoraTorchTensor(lora_a, lora_b))
+                        dest = super(skip_linear_reorder_parent, self).modify_tensors(data_torch, name, bid)
+                    else:
+                        dest = super().modify_tensors(data_torch, name, bid)
+                else:
+                    dest = super().modify_tensors(data_torch, name, bid)
+
                 for dest_name, dest_data in dest:
                     assert isinstance(dest_data, LoraTorchTensor)
                     lora_a, lora_b = dest_data.get_lora_A_B()
