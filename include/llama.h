@@ -189,7 +189,6 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q4_0_4_8      = 34, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q4_0_8_8      = 35, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4         = 38, // except 1d tensors, 38 to be compatible with mainline
-        LLAMA_FTYPE_MOSTLY_Q1_0_G128     = 41, // except 1d tensors, 38 to be compatible with mainline
         //
         LLAMA_FTYPE_MOSTLY_Q6_0          = 135, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_IQ1_BN        = 136, // except 1d tensors
@@ -379,9 +378,6 @@ extern "C" {
         int32_t  n_seq_max;
         int32_t  n_ubatch;
         int32_t  amb;
-        int32_t  fit_margin;
-        bool     fit;
-        int32_t  worst_graph_tokens;
 
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
@@ -428,7 +424,6 @@ extern "C" {
         uint32_t n_threads;         // number of threads to use for generation
         uint32_t n_threads_batch;   // number of threads to use for batch processing
         int32_t  max_extra_alloc;   // Max. additional VRAM the scheduler is allowed to allocate
-        int32_t  worst_case_tokens; // number of tokens to use when reserving worst case graphs
 
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
@@ -468,10 +463,10 @@ extern "C" {
         float thresh_experts;
         bool only_active_experts;
         bool k_cache_hadamard;  // if true, apply Hadamard transfrom to K-cache
-        bool v_cache_hadamard;  // if true, apply Hadamard transfrom to V-cache (needs FA)
         bool split_mode_graph_scheduling; // if true, force split mode graph scheduling
         //bool split_mode_f16;    // if true, cast intermediate results to f16 before copying to other GPUs
         bool scheduler_async;   // if true, with split mode "graph" graph evaluation will be done using multiple threads
+        bool rys_splice_fastpath; // if true, allow the specialized RYS splice IQ4_NL fast path when supported
         bool mtp;   // Activate MTP if supported
         enum llama_mtp_op_type mtp_op_type;
 
@@ -662,8 +657,6 @@ extern "C" {
     LLAMA_API bool llama_model_is_hybrid(const struct llama_model * model);
 
     LLAMA_API bool llama_model_has_recurrent(const struct llama_model * model);
-
-    LLAMA_API enum llama_split_mode llama_model_get_split_mode(const struct llama_model * model);
 
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(

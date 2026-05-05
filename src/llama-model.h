@@ -459,6 +459,8 @@ struct llama_model {
         return tensor_overrides;
     }
 
+    bool supports_rys_splice_fastpath() const;
+
     size_t cache_size(int il, ggml_type type_k, ggml_type type_v, uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) const;
 
     void set_tensor_overrides(const llama_model_params& params);
@@ -541,4 +543,3 @@ struct LLM_TN {
 std::string llama_model_ftype_name(llama_ftype ftype);
 
 const char * llama_model_type_name(e_model type);
-

@@ -11,7 +11,62 @@
 
 #define QWEN3NEXT_CHUNK_SIZE 64
 
-delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_lctx), batch(_batch) {
+namespace {
+struct delta_qkv_views {
+    ggml_tensor * q;
+    ggml_tensor * k;
+    ggml_tensor * v;
+};
+
+static delta_qkv_views build_convolved_qkv_views(ggml_context * ctx0, ggml_tensor * conv_output_silu,
+        int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads,
+        int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tok, float eps_norm, bool single_token_decode,
+        int il, const llm_build_cb & cb) {
+    const int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
+    const int64_t nb1_qkv = ggml_row_size(conv_output_silu->type, qkv_dim);
+
+    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_output_silu, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(conv_output_silu->type, head_k_dim), nb1_qkv, nb1_qkv * n_tok, 0);
+
+    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_output_silu, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(conv_output_silu->type, head_k_dim), nb1_qkv, nb1_qkv * n_tok,
+            head_k_dim * num_k_heads * ggml_element_size(conv_output_silu));
+
+    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_output_silu, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(conv_output_silu->type, head_v_dim), nb1_qkv, nb1_qkv * n_tok,
+            ggml_row_size(conv_output_silu->type, 2 * head_k_dim * num_k_heads));
+
+    cb(q_conv, "q_conv", il);
+    cb(k_conv, "k_conv", il);
+    cb(v_conv, "v_conv", il);
+
+    if (single_token_decode) {
+        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+        q_conv = ggml_permute(ctx0, q_conv, 0, 2, 1, 3);
+        k_conv = ggml_permute(ctx0, k_conv, 0, 2, 1, 3);
+    } else {
+        q_conv = ggml_permute(ctx0, q_conv, 0, 2, 1, 3);
+        k_conv = ggml_permute(ctx0, k_conv, 0, 2, 1, 3);
+        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    }
+
+    cb(q_conv, "q_conv_normed", il);
+    cb(k_conv, "k_conv_normed", il);
+
+    return { q_conv, k_conv, v_conv };
+}
+}
+
+delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) :
+        lctx(_lctx),
+        batch(_batch),
+        all_same_seq(false),
+        has_unique_seq_ids(false),
+        rys_decode_fastpath(false),
+        rys_decode_reset_state(false),
+        rys_decode_state_seq_id(0) {
     auto & model = lctx.model;
     auto & hparams = model.hparams;
 
@@ -70,6 +125,12 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
         GGML_ASSERT((uint32_t) s < qnext_state_slots);
     }
 
+    rys_decode_fastpath = lctx.cparams.rys_splice_fastpath && batch.n_tokens == 1 && all_same_seq;
+    if (rys_decode_fastpath) {
+        rys_decode_state_seq_id = (uint32_t) token_seq_ids.front();
+        rys_decode_reset_state = batch.pos != nullptr && batch.pos[0] == 0;
+    }
+
 }
 
 delta_net::~delta_net() = default;
@@ -77,7 +138,7 @@ delta_net::~delta_net() = default;
 std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_context * ctx0,
         ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
         ggml_tensor * g, ggml_tensor * beta, ggml_tensor * state,
-        int il, const llm_build_cb & cb, int repeat_type) {
+        int il, const llm_build_cb & cb, int repeat_type, bool rys_decode_fastpath) {
 
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[2];
@@ -95,6 +156,11 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H_v && state->ne[3] == n_seqs);
     //GGML_ASSERT(H_k == H_v);
     GGML_ASSERT(H_v % H_k == 0);
+    if (rys_decode_fastpath) {
+        GGML_ASSERT(n_tokens == 1);
+        GGML_ASSERT(n_seqs == 1);
+        GGML_ASSERT(state->type == GGML_TYPE_F32);
+    }
 
     cb(q,    "q_in", il);
     cb(k,    "k_in", il);
@@ -281,7 +347,7 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
         ggml_tensor * qkv_mixed, ggml_tensor * inp_s_seq_qnext, ggml_tensor * beta, ggml_tensor * gate,
         int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, int64_t ssm_d_conv,
         int64_t state_seq_id_local, uint32_t qnext_state_slots, bool reset_state_local,
-        float eps_norm, int repeat_type, int il, const llm_build_cb & cb, ggml_cgraph * gf) {
+        float eps_norm, int repeat_type, bool rys_decode_fastpath, int il, const llm_build_cb & cb, ggml_cgraph * gf) {
     const int64_t key_dim        = head_k_dim * num_k_heads;
     const int64_t value_dim      = head_v_dim * num_v_heads;
     const int64_t conv_dim       = key_dim * 2 + value_dim;
@@ -293,6 +359,11 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     const int64_t n_seq_tokens = qkv_mixed->ne[1];
     const int64_t n_seqs       = qkv_mixed->ne[2];
     const int64_t n_tok        = n_seq_tokens * n_seqs;
+    const bool single_token_decode = rys_decode_fastpath || n_seq_tokens == 1;
+    if (rys_decode_fastpath) {
+        GGML_ASSERT(n_seq_tokens == 1);
+        GGML_ASSERT(n_seqs == 1);
+    }
 
     size_t state_row_size = 0;
     ggml_tensor * state_all = nullptr;
@@ -306,9 +377,7 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
 
     ggml_tensor * state_dst = ggml_view_2d(ctx0, state_all, state_dim, 1, state_row_size, state_seq_id_local * state_row_size);
     ggml_tensor * state_f32 = state_dst;
-    if (state_f32->type != GGML_TYPE_F32) {
-        state_f32 = ggml_cast(ctx0, state_f32, GGML_TYPE_F32);
-    }
+    GGML_ASSERT(state_f32->type == GGML_TYPE_F32);
     if (reset_state_local) {
         state_f32 = ggml_scale(ctx0, state_f32, 0.0f);
         cb(state_f32, "state_reset", il);
@@ -332,41 +401,11 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(conv_output_silu, "conv_output_silu", il);
     ggml_build_forward_expand(gf, conv_output_silu);
 
-    // Calculate the total conv dimension
-    int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
-    int64_t nb1_qkv = ggml_row_size(conv_output_silu->type, qkv_dim);
+    auto qkv_views = build_convolved_qkv_views(ctx0, conv_output_silu,
+            head_k_dim, num_k_heads, head_v_dim, num_v_heads,
+            n_seq_tokens, n_seqs, n_tok, eps_norm, single_token_decode, il, cb);
 
-    // Extract the convolved Q, K, V from conv_output
-    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_output_silu, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_output_silu->type, head_k_dim), nb1_qkv, nb1_qkv * n_tok, 0);
-
-    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_output_silu, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_output_silu->type, head_k_dim), nb1_qkv, nb1_qkv * n_tok,
-            head_k_dim * num_k_heads * ggml_element_size(conv_output_silu));
-
-    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_output_silu, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_output_silu->type, head_v_dim), nb1_qkv, nb1_qkv * n_tok,
-            ggml_row_size(conv_output_silu->type, 2 * head_k_dim * num_k_heads));
-
-    cb(q_conv, "q_conv", il);
-    cb(k_conv, "k_conv", il);
-    cb(v_conv, "v_conv", il);
-
-    if (n_seq_tokens > 1) {
-        q_conv = ggml_permute(ctx0, q_conv, 0, 2, 1, 3);
-        k_conv = ggml_permute(ctx0, k_conv, 0, 2, 1, 3);
-        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
-    } else {
-        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
-        q_conv = ggml_permute(ctx0, q_conv, 0, 2, 1, 3);
-        k_conv = ggml_permute(ctx0, k_conv, 0, 2, 1, 3);
-    }
-    cb(q_conv, "q_conv_normed", il);
-    cb(k_conv, "k_conv_normed", il);
-
-    auto [output, new_state] = build_fused_delta_net(ctx0, q_conv, k_conv, v_conv, gate, beta, state, il, cb, repeat_type);
+    auto [output, new_state] = build_fused_delta_net(ctx0, qkv_views.q, qkv_views.k, qkv_views.v, gate, beta, state, il, cb, repeat_type, rys_decode_fastpath);
 
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
@@ -516,7 +555,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             auto output = build_qkv(ctx0, split_s_l->splits[id], split_ssm_conv1d->splits[id], qkv_mixed, inp_s_seq_qnext, beta, gate,
                                head_k_dim, num_k_heads_id, head_v_dim, num_v_heads_id, hparams.ssm_d_conv,
                                state_seq_id_local, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
-                               l.ssm_beta_alpha ? 0 : 1, il, cb, gf);
+                               l.ssm_beta_alpha ? 0 : 1, rys_decode_fastpath, il, cb, gf);
             split_norm = (ggml_split_tensor_t *)l.ssm_norm->extra;
             GGML_ASSERT(split_norm && split_norm->splits[id]);
             auto split_ssm_out = (ggml_split_tensor_t *)l.ssm_out->extra;
@@ -570,7 +609,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
         qkv_mixed, inp_s_seq_qnext, beta, gate,
         head_k_dim, num_k_heads, head_v_dim, num_v_heads, hparams.ssm_d_conv,
         state_seq_id_local, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
-        model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf);
+        model.layers[il].ssm_beta_alpha ? 0 : 1, rys_decode_fastpath, il, cb, gf);
 
     auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb);
     if (inp_out_ids) {
@@ -601,6 +640,10 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     GGML_ASSERT(model.layers[il].wqkv != nullptr || model.layers[il].ssm_in != nullptr);
     GGML_ASSERT(model.layers[il].wqkv_gate != nullptr || model.layers[il].ssm_in != nullptr);
 
+    if (rys_decode_fastpath) {
+        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_seq_qnext, inp_out_ids, rys_decode_state_seq_id, rys_decode_reset_state, il, cb);
+    }
+
     if (all_same_seq) {
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
         return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb);
@@ -623,4 +666,3 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
     return out;
 
 }
-

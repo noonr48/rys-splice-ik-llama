@@ -36,20 +36,6 @@ static inline const char * llm_expert_gating_func_name(llm_expert_gating_func_ty
     }
 }
 
-static bool llm_detect_qwen35_recurrent_layer(const llama_model_loader & ml, uint32_t il, uint32_t fallback_interval) {
-    const std::string ssm_name = "blk." + std::to_string(il) + ".ssm_conv1d.weight";
-    if (ml.get_tensor_meta(ssm_name.c_str()) != nullptr) {
-        return true;
-    }
-
-    const std::string attn_q_name = "blk." + std::to_string(il) + ".attn_q.weight";
-    if (ml.get_tensor_meta(attn_q_name.c_str()) != nullptr) {
-        return false;
-    }
-
-    return ((il + 1) % fallback_interval != 0);
-}
-
 
 void llm_load_hparams(
         llama_model_loader & ml,
@@ -511,7 +497,7 @@ void llm_load_hparams(
                     uint32_t full_attn_interval = 4;
                     ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
-                        hparams.recurrent_layer_arr[i] = llm_detect_qwen35_recurrent_layer(ml, i, full_attn_interval);
+                        hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
                     }
                 }
 
@@ -539,7 +525,7 @@ void llm_load_hparams(
                     uint32_t full_attn_interval = 4;
                     ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
-                        hparams.recurrent_layer_arr[i] = llm_detect_qwen35_recurrent_layer(ml, i, full_attn_interval);
+                        hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
                     }
                 }
 

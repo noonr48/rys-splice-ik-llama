@@ -1678,7 +1678,6 @@ std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q6_0_R4:  return "Q6_0_R4 - 6.5 bpw";
         case LLAMA_FTYPE_MOSTLY_Q8_0_R8:  return "Q8_0_R8 - 8.5 bpw";
         case LLAMA_FTYPE_MOSTLY_MXFP4:    return "MXFP4 - 4.25 bpw";
-        case LLAMA_FTYPE_MOSTLY_Q1_0_G128:return "Q1_0_G128 - 1.125 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:   return "IQ4_XS - 4.25 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ4_KS:   return "IQ4_KS - 4.25 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ4_KS_R4:return "IQ4_KS_R4 - 4.25 bpw";
@@ -1838,39 +1837,52 @@ bool llama_model_has_recurrent(const llama_model * model) {
     return llm_arch_is_hybrid(model->arch) || llm_arch_is_recurrent(model->arch);
 }
 
-enum llama_split_mode llama_model_get_split_mode(const struct llama_model * model) {
-    return model->split_mode;
-}
-
-llm_tensor llm_tensor_type(llm_arch arch, const std::string & tensor_name, int il) {
-    auto it = LLM_TENSOR_NAMES.find(arch);
-    if (it == LLM_TENSOR_NAMES.end()) {
-        printf("%s: Oops, did not find arch\n", __func__);
-        return LLM_TENSOR_UNKNOWN;
+bool llama_model::supports_rys_splice_fastpath() const {
+    if (arch != LLM_ARCH_QWEN35) {
+        return false;
     }
-    if (il < 0) {
-        for (auto & entry : it->second) {
-            if (tensor_name.find(entry.second) == 0) {
-                return entry.first;
+
+    if (ftype != LLAMA_FTYPE_MOSTLY_IQ4_NL && ftype != LLAMA_FTYPE_MOSTLY_IQ4_NL_R4) {
+        return false;
+    }
+
+    const auto & hp = hparams;
+
+    if (hp.n_layer != 72 || hp.n_ctx_train != 262144 || hp.n_embd != 5120 || hp.n_embd_head_k != 256 || hp.n_embd_head_v != 256) {
+        return false;
+    }
+
+    if (hp.ssm_d_conv != 4 || hp.ssm_d_inner != 6144 || hp.ssm_d_state != 128 || hp.ssm_dt_rank != 48 || hp.ssm_n_group != 16) {
+        return false;
+    }
+
+    if (layers.size() != hp.n_layer) {
+        return false;
+    }
+
+    for (uint32_t il = 0; il < hp.n_layer; ++il) {
+        if (hp.n_head(il) != 24 || hp.n_head_kv(il) != 4 || hp.n_ff(il) != 17408) {
+            return false;
+        }
+
+        const bool expect_recurrent = (il % 4) != 3;
+        if (hp.is_recurrent(il) != expect_recurrent) {
+            return false;
+        }
+
+        if (!expect_recurrent) {
+            const auto * wv = layers[il].wv;
+            if (wv == nullptr) {
+                return false;
+            }
+
+            if (wv->type != GGML_TYPE_IQ5_K && wv->type != GGML_TYPE_IQ5_K_R4) {
+                return false;
             }
         }
-        return LLM_TENSOR_UNKNOWN;
     }
-    for (auto & entry : it->second) {
-        auto base_name = ::format(entry.second.c_str(), il);
-        auto this_name = base_name + ".weight";
-        if (tensor_name.find(this_name) == 0) {
-            return entry.first;
-        }
-        this_name = base_name + ".bias";
-        if (tensor_name.find(this_name) == 0) {
-            return entry.first;
-        }
-        if (tensor_name.find(base_name) == 0) {
-            return entry.first;
-        }
-    }
-    return LLM_TENSOR_UNKNOWN;
+
+    return true;
 }
 
 size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) const {

@@ -181,9 +181,6 @@ struct create_tensors_helper : public create_tensors_helper_interface {
     ggml_context * ctx_output;
     ggml_context * ctx_output_split;
 
-    ggml_backend_buffer_type_t default_cpu_buft;
-    bool has_buft_overrides = false;
-
     std::unordered_set<ggml_tensor *> split_tensors;
 
     std::vector<std::pair<std::regex, ggml_backend_buffer_type_t>> overrides;
@@ -218,18 +215,14 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
         buft_layer_count[model.buft_layer[i].buft_matrix]++;
     }
 
-    default_cpu_buft = llama_default_buffer_type_cpu(true);
-
     if (ml.tensor_buft_overrides) {
         for (const auto * o = ml.tensor_buft_overrides; o->pattern != nullptr; ++o) {
-            auto buft = o->buft;
-            if (ggml_backend_buft_is_host(buft)) buft = default_cpu_buft;
-            overrides.emplace_back(std::make_pair(std::regex(o->pattern), buft));
+            overrides.emplace_back(std::make_pair(std::regex(o->pattern), o->buft));
         }
     }
 
     if (ml.ncmoe > 0) {
-        auto buft = llama_default_buffer_type_cpu(true);
+        auto buft = ggml_backend_cpu_buffer_type();
         if (model.split_mode == LLAMA_SPLIT_MODE_ATTN || model.split_mode == LLAMA_SPLIT_MODE_GRAPH || ml.ncmoe >= n_layer || model.devices.size() < 2) {
             int nmax = std::min(ml.ncmoe, n_layer);
             for (int i = 0; i < nmax; ++i) {
@@ -406,7 +399,6 @@ static std::vector<int> create_split(int nr, int granularity, const std::vector<
 ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx, const std::string & name) {
     for (auto & o : overrides) {
         if (std::regex_search(name, o.first)) {
-            if (o.second == default_cpu_buft) has_buft_overrides = true;
             const struct ggml_tensor * cur = ml.get_tensor_meta(name.c_str());
             const size_t nbytes = cur ? ggml_nbytes(cur) : 0;
             LLAMA_LOG_INFO("Tensor %s (size = %.2f MiB) buffer type overriden to %s\n", name.c_str(), nbytes/1024./1024., ggml_backend_buft_name(o.second));
@@ -3944,11 +3936,6 @@ bool create_tensors_helper::create_tensors() {
         default:
             throw std::runtime_error("unknown architecture");
     }
-
-    if (getenv("GGML_CUDA_NO_PINNED") == nullptr) {
-        use_mmap_buffer &= !has_buft_overrides;
-    }
-
     if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) {
         const int n_layer = model.mtp ? model.layers.size()
                                   : model.layers.size() - model.hparams.nextn_predict_layers;
@@ -3974,10 +3961,6 @@ bool create_tensors_helper::create_tensors() {
                 }
             }
         }
-        std::vector<float> gpu_split_count;
-        if (model.max_gpu > 0 && model.max_gpu < int(model.splits.size())) {
-            gpu_split_count.resize(model.splits.size(), 0.0f);
-        }
         for (int il = 0; il < n_layer; ++il) {
             int gqa_ratio = hparams.n_head(il) / hparams.n_head_kv(il);
             if (ggml_backend_buft_is_host(model.buft_layer[il].buft_matrix)) {
@@ -3987,17 +3970,11 @@ bool create_tensors_helper::create_tensors() {
             if (model.max_gpu > 0 && model.max_gpu < int(model.splits.size()) && il % adjust_step == 0) {
                 cur_splits = model.splits;
                 adjust_split(cur_splits, mem_used, model.max_gpu);
-                LLAMA_LOG_INFO("Adjusted split at layer %2d:  ", il);
+                LLAMA_LOG_INFO("Adjusted split at layer %2d:", il);
                 float last_split = 0;
-                for (int i = 0; i < (int)cur_splits.size(); ++i) {
-                    if (i > 0) {
-                        LLAMA_LOG_INFO(" ; ");
-                    }
-                    LLAMA_LOG_INFO("GPU%d: %4g", i, cur_splits[i] - last_split);
-                    if (i < int(gpu_split_count.size())) {
-                        gpu_split_count[i] += cur_splits[i] - last_split;
-                    }
-                    last_split = cur_splits[i];
+                for (auto & p : cur_splits) {
+                    LLAMA_LOG_INFO(" %g", p - last_split);
+                    last_split = p;
                 }
                 LLAMA_LOG_INFO("\n");
             }
@@ -4264,17 +4241,6 @@ bool create_tensors_helper::create_tensors() {
                     prepare_split_tensors(-1, ctx_split, layer.ffn_exp_probs_b, layer.split_ffn_exp_probs_b, shared_split, mem_used);
                 }
             }
-        }
-
-        if (!gpu_split_count.empty()) {
-            LLAMA_LOG_INFO("Adjusted splits (total)   :  ");
-            for (int i = 0; i < (int)gpu_split_count.size(); ++i) {
-                if (i > 0) {
-                    LLAMA_LOG_INFO(" ; ");
-                }
-                LLAMA_LOG_INFO("GPU%d: %4g", i, gpu_split_count[i]);
-            }
-            LLAMA_LOG_INFO("\n");
         }
 
         if (model.output) {

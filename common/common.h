@@ -139,7 +139,7 @@ thinking_tokens thinking_tokens_from_string(const std::string& format);
 enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
-    COMMON_SPECULATIVE_TYPE_MTP,           // MTP model
+    COMMON_SPECULATIVE_TYPE_MTP,           // MTP model 
     COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
@@ -226,9 +226,6 @@ struct gpt_params {
     int32_t main_gpu              =       0; // the GPU that is used for scratch and small tensors
     int32_t max_gpu               =       0; // max number of GPUs to use at a time for split mode "graph"
     int32_t ncmoe                 =       0; // number of layers in which MoE tensors are left in VRAM
-    int32_t fit_margin            =       0; // safety margin for auto-fit in MiB
-    bool    fit                   =   false; // automatically fit model (for now just using MoE tensor overrides)
-    int32_t worst_graph_tokens    =       0; // number of tokens to use when reserving the worst graph
     float   tensor_split[128]     =     {0}; // how split tensors should be distributed across GPUs
     int32_t grp_attn_n            =       1; // group-attention factor
     int32_t grp_attn_w            =     512; // group-attention width
@@ -359,10 +356,10 @@ struct gpt_params {
     bool merge_qkv         = false; // if true, merge separate Q, K, V tensors into a single, contiguous tensor
     bool merge_up_gate_exps= false; // if true, merge ffn_up_exps and ffn_gate_exps into a single, contiguous tensor
     bool k_cache_hadamard  = false; // if true, use Hadamard transform for the K-cache (only makes sense with quantized cache)
-    bool v_cache_hadamard  = false; // if true, use Hadamard transform for the V-cache (only makes sense with quantized cache, which requires FA)
     bool split_mode_graph_scheduling = false; // if true, force split mode graph scheduling
     //bool split_mode_f16    = true;  // if true, intermediate results will be cast to f16 before copying to other GPUs to perform reduce ops
     bool scheduler_async   = false; // if true, in split mode graph the scheduler will use multiple threads to evaluate the graph
+    bool rys_splice_fastpath = false; // if true, enable the specialized RYS splice IQ4_NL fast path when supported
     int  fused_delta_net   = 0;     // use fused delta-net if number of tokens in the batch is less than this value
     bool has_mtp           = false; // enable MTP if supported by the model
 
@@ -378,7 +375,6 @@ struct gpt_params {
     std::vector<std::string> image; // path to image file(s)
     int image_min_tokens = -1;
     int image_max_tokens = -1;
-    std::string mtmd_kq_type = "f32";
 
     // embedding
     bool embedding         = false; // get only sentence embedding
@@ -397,7 +393,6 @@ struct gpt_params {
     std::string public_path   = "";
     std::string chat_template = "";
     bool use_jinja = false;                                                                                 // NOLINT
-    bool use_peg = false;
     std::string system_prompt = "";
     bool enable_chat_template = true;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
